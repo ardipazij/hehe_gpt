@@ -2,10 +2,6 @@ import torch
 from torch import nn
 
 
-import torch
-from torch import nn
-
-
 class HeadAttention(nn.Module):
     def __init__(self, emb_size: int, head_size: int, max_seq_len: int):
         super().__init__()
