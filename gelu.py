@@ -1,0 +1,18 @@
+import torch
+import math
+from torch import nn
+
+
+class GELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor):
+        return (
+            0.5
+            * x
+            * (
+                1
+                + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))
+            )
+        )
