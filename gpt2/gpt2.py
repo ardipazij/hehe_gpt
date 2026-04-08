@@ -1,7 +1,10 @@
 import torch
+import math
 from torch import nn
-from torch.utils.data import Dataset
 
+from positional embeddings import PositionalEmbeddings
+from ffn import FeedForward
+from decoder import Decoder
 
 class GetData(Dataset):
     def __init__(self, data: list, seq_len: int, device: str):
@@ -28,130 +31,6 @@ class TokenEmbeddings(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return self.embedding(x)
-
-
-class PositionalEmbeddings(nn.Module):
-    def __init__(self, vocab_size: int, emb_size: int):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.emb_size = emb_size
-        self.embedding = nn.Embedding(self.vocab_size, self.emb_size)
-
-    def forward(self, seq_len: int):
-        return self.embedding(torch.Tensor([i for i in range(seq_len)]).long())
-
-
-class FeedForward(nn.Module):
-    def __init__(self, emb_size: int, dropout=0.1):
-        super().__init__()
-
-        self.emb_size = emb_size
-
-        self.first_linear = nn.Linear(self.emb_size, self.emb_size * 4)
-        self.relu = nn.ReLU(inplace=True)
-        self.second_linear = nn.Linear(self.emb_size * 4, self.emb_size)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor):
-        first_iter = self.first_linear(x)
-        func_act = self.relu(first_iter)
-        second_iter = self.second_linear(func_act)
-
-        return self.dropout(second_iter)
-
-
-class HeadAttention(nn.Module):
-    def __init__(self, emb_size: int, head_size: int, max_seq_len: int):
-        super().__init__()
-        self.emb_size = emb_size
-        self.head_size = head_size
-        self.max_seq_len = max_seq_len
-        self.W_k = nn.Linear(emb_size, head_size)
-        self.W_q = nn.Linear(emb_size, head_size)
-        self.W_v = nn.Linear(emb_size, head_size)
-        mask = torch.tril(torch.ones(int(max_seq_len), int(max_seq_len)))
-
-        self.register_buffer("mask", mask)
-
-    def forward(self, x: torch.Tensor):
-        k = self.W_k(x)
-        q = self.W_q(x)
-        v = self.W_v(x)
-
-        score = (q @ k.transpose(-2, -1)) / self.head_size**0.5
-
-        score = score.masked_fill(
-            self.mask[: x.size(1), : x.size(1)] == 0, float("-inf")
-        )
-        w = torch.softmax(score, dim=-1)
-
-        return w @ v
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(
-        self,
-        num_heads: int,
-        emb_size: int,
-        head_size: int,
-        max_seq_len: int,
-        dropout=0.1,
-    ):
-        super().__init__()
-
-        self.num_heads = num_heads
-        self.emb_size = emb_size
-        self.head_size = head_size
-        self.max_seq_len = max_seq_len
-
-        self.heads = nn.ModuleList(
-            [
-                HeadAttention(self.emb_size, self.head_size, self.max_seq_len)
-                for _ in range(self.num_heads)
-            ]
-        )
-
-        self.W_o = nn.Linear(self.head_size * self.num_heads, self.emb_size)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor):
-        head_result = torch.cat(
-            [current_head.forward(x) for current_head in self.heads], dim=-1
-        )
-        head_lin_result = self.W_o(head_result)
-        return self.dropout(head_lin_result)
-
-
-class Decoder(nn.Module):
-
-    def __init__(
-        self,
-        num_heads: int,
-        emb_size: int,
-        head_size: int,
-        max_seq_len: int,
-        dropout=0.1,
-    ):
-        super().__init__()
-        self.mha = MultiHeadAttention(
-            num_heads, emb_size, head_size, max_seq_len, dropout
-        )
-        self.ffn = FeedForward(emb_size, dropout)
-        self.first_norm = nn.LayerNorm(emb_size)
-        self.second_norm = nn.LayerNorm(emb_size)
-
-    def forward(self, x: torch.Tensor):
-        first_norm = self.first_norm(x)
-        first_iter = self.mha.forward(first_norm)
-        result_first_iter = first_iter + x
-
-        second_norm = self.second_norm(result_first_iter)
-
-        second_iter = self.ffn(second_norm)
-        result_second_iter = result_first_iter + second_iter
-
-        return result_second_iter
-
 
 class GPT2(nn.Module):
     def __init__(
@@ -188,34 +67,52 @@ class GPT2(nn.Module):
         )
         self.linear = nn.Linear(emb_size, vocab_size)
 
-    def forward(self, x):
-        res_te = self.te.forward(x)
-        res_pe = self.pe.forward(x.size(1))
+    def forward(self, x, use_cache=True, cache=None):
+        if cache is None:
+            res_te = self.te(x)
+            res_pe = self.pe(x.size(1)) 
+        else:
+            start_pos = cache[0][0][0].size(1) 
+            res_te = self.te(x)
+            res_pe = self.pe(1, start_pos=start_pos)
 
-        input_embs = res_te + res_pe
+        x_embs = self.dropout(res_te + res_pe)
 
-        res_drop = self.dropout(input_embs)
+        new_cache = [] if use_cache else None
+        
+        for i, decoder_layer in enumerate(self.decoders):
+            layer_cache = cache[i] if cache is not None else None
+            x_embs, layer_new_cache = decoder_layer(x_embs, use_cache=use_cache, cache=layer_cache)
+            
+            if use_cache:
+                new_cache.append(layer_new_cache)
 
-        for decoder_layer in self.decoders:
-            res_drop = decoder_layer.forward(res_drop)
-        res_drop = self.the_last_layer(res_drop)
-        logits = self.linear(res_drop)
+        x_embs = self.the_last_layer(x_embs)
+        logits = self.linear(x_embs)
 
-        return logits
+        return (logits, new_cache) if use_cache else (logits, None)
 
     def generate(
         self,
         x: torch.Tensor,
         max_new_tokens: int,
         do_sample: bool,
+        use_cache=True,
         top_k=None,
         top_p=None,
         temperature=1.0,
     ):
-        for _ in range(max_new_tokens):
-            x_cond = x[:, -self.max_seq_len :]
+        current_cache = None
+        
+        for i in range(max_new_tokens):
+            if use_cache and current_cache is not None:
+                x_input = x[:, -1:]
+            else:
+                x_input = x
 
-            logits = self.forward(x_cond)[:, -1, :] / temperature
+            logits, current_cache = self.forward(x_input, use_cache=use_cache, cache=current_cache)
+            
+            logits = logits[:, -1, :] / temperature
 
             if do_sample:
                 if top_k is not None:
@@ -224,22 +121,15 @@ class GPT2(nn.Module):
 
                 if top_p is not None:
                     probs = torch.softmax(logits, dim=-1)
-                    sorted_probs, sorted_indices = torch.sort(
-                        probs, descending=True, dim=-1
-                    )
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
                     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
                     keep_sorted = cumulative_probs < top_p
-                    keep_sorted[:, 0] = (
-                        1  # Всегда оставляем токен с мин. кум. вероятностью
-                    )
+                    keep_sorted[:, 0] = 1 
 
-                    top_p_mask = torch.zeros_like(keep_sorted, dtype=torch.uint8)
-                    top_p_mask.scatter_(
-                        dim=-1, index=sorted_indices, src=keep_sorted.byte()
-                    )
-
-                    logits[top_p_mask == 0] = float("-inf")
+                    top_p_mask = torch.zeros_like(keep_sorted, dtype=torch.bool)
+                    top_p_mask.scatter_(dim=-1, index=sorted_indices, src=keep_sorted)
+                    logits[~top_p_mask] = float("-inf")
 
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
@@ -284,3 +174,9 @@ class GPT2(nn.Module):
                         logits_flat, targets_flat
                     )
                     self.valid_loss = v_loss
+
+
+
+
+
+
